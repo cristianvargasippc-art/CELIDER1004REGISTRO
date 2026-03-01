@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CELIDER 10-04 — Listado Oficial de Comisiones</title>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700;800;900&family=Open+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, get, onValue, update } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDQR_k9wAw1MZSLQnT5U1mKIViRfnO4btw",
+    authDomain: "celider1004-851c7.firebaseapp.com",
+    databaseURL: "https://celider1004-851c7-default-rtdb.europe-west1.firebasedatabase.app",
+    projectId: "celider1004-851c7",
+    storageBucket: "celider1004-851c7.firebasestorage.app",
+    messagingSenderId: "400841370969",
+    appId: "1:400841370969:web:fcf29bf99ab37ba2a87048",
+    measurementId: "G-JWRS83249H"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+
+  // ── STATE ──────────────────────────────────────────────────────────────────
+  let isAdmin = false;
+  let allParticipants = [];
+  let commissions = {};
+
+  // ── HELPERS ───────────────────────────────────────────────────────────────
+  function slugify(str) {
+    return str.trim().toUpperCase()
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^A-Z0-9\s]/g, "")   // remove special chars like - . first
+      .replace(/\s+/g, "_")           // spaces to underscores
+      .replace(/_+/g, "_")             // collapse multiple underscores
+      .replace(/^_|_$/g, "");          // trim edge underscores
+  }
+
+  function showSection(id) {
+    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+  }
+
+  function toast(msg, type = 'success') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show ' + type;
+    setTimeout(() => t.classList.remove('show'), 3500);
+  }
+
+  // ── FIREBASE LOAD ─────────────────────────────────────────────────────────
+  function loadFromFirebase() {
+    const partRef = ref(db, 'participants');
+    onValue(partRef, snap => {
+      allParticipants = [];
+      if (snap.exists()) {
+        snap.forEach(child => {
+          allParticipants.push({ id: child.key, ...child.val() });
+        });
+      }
+      renderAdminTable();
+      renderPublicCommissions();
+    });
+
+    const commRef = ref(db, 'commissions');
+    onValue(commRef, snap => {
+      commissions = snap.exists() ? snap.val() : {};
+      renderCommissionLinks();
+    });
+  }
+
+  // ── EXCEL UPLOAD ──────────────────────────────────────────────────────────
+
+  // Normaliza texto: quita tildes, espacios extra, pasa a minúsculas
+  function norm(str) {
+    return String(str || '')
+      .trim()
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, " ");
+  }
+
+  // Busca la columna cuyo encabezado contenga alguna de las palabras clave
+  function findCol(keys, ...keywords) {
+    return keys.find(k => keywords.some(kw => norm(k).includes(norm(kw)))) || null;
+  }
+
+  window.handleExcelUpload = function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+      try {
+        const wb = XLSX.read(evt.target.result, { type: 'binary' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+
+        // raw:false convierte todo a string, header:1 da arreglo de arreglos
+        const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+        if (!raw || raw.length < 2) {
+          toast('El archivo está vacío o no tiene datos', 'error');
+          return;
+        }
+
+        // Primera fila = encabezados
+        const headers = raw[0].map(h => String(h).trim());
+        console.log("Encabezados detectados:", headers);
+
+        // Mapear columnas — acepta: INSTITUCIÓN, NOMBRE, DESIGNACIÓN, COMISIÓN (y variantes)
+        const iInst  = headers.findIndex(h => ['instituc','school','colegio','liceo','plantel'].some(k => norm(h).includes(k)));
+        const iNomb  = headers.findIndex(h => ['nombre','name','delegado','participante'].some(k => norm(h).includes(k)));
+        const iDesig = headers.findIndex(h => ['designac','cargo','designation','s.e','se '].some(k => norm(h).includes(k)));
+        const iComis = headers.findIndex(h => ['comision','commission','comite','committee','asignac'].some(k => norm(h).includes(k)));
+
+        console.log(`Cols → INSTITUCIÓN:${iInst} NOMBRE:${iNomb} DESIGNACIÓN:${iDesig} COMISIÓN:${iComis}`);
+
+        if (iNomb === -1 || iComis === -1) {
+          const dbg = document.getElementById('debugLog');
+          dbg.style.display = 'block';
+          dbg.textContent = `❌ No se detectaron las columnas correctas.\n\nEncabezados encontrados en tu archivo:\n${headers.map((h,i)=>`  [${i}] "${h}"`).join('\n')}\n\nAsegúrate de que la fila 1 tenga: NOMBRE y COMISIÓN`;
+          toast('⚠️ No se encontraron columnas — revisa el panel de diagnóstico', 'error');
+          return;
+        }
+        // Columnas detectadas OK — ocultar debug
+        document.getElementById('debugLog').style.display = 'none';
+
+        // Filas de datos (desde fila 1 en adelante)
+        const dataRows = raw.slice(1).filter(row => row.some(cell => String(cell).trim() !== ''));
+
+        if (!dataRows.length) {
+          toast('No hay filas de datos en el archivo', 'error');
+          return;
+        }
+
+        const updates = {};
+        let count = 0;
+        dataRows.forEach((row, i) => {
+          const nombre     = String(row[iNomb]  || '').trim();
+          const comision   = String(row[iComis] || '').trim().toUpperCase();
+          const institucion = iInst  >= 0 ? String(row[iInst]  || '').trim() : '';
+          const designacion = iDesig >= 0 ? String(row[iDesig] || '').trim().toUpperCase() : '';
+
+          if (!nombre || !comision) return;
+
+          const id = `p_${i}_${nombre.replace(/\s+/g,'_').substring(0,20)}`;
+          updates[`participants/${id}`] = { nombre, comision, institucion, designacion };
+          count++;
+        });
+
+        if (!count) {
+          toast('No se encontraron filas válidas con nombre y comisión', 'error');
+          return;
+        }
+
+        // Borrar todo y subir nuevo listado
+        set(ref(db, 'participants'), null)
+          .then(() => update(ref(db), updates))
+          .then(() => {
+            toast(`✅ ${count} participantes cargados exitosamente`);
+            document.getElementById('excelFile').value = '';
+          })
+          .catch(err => toast('Error Firebase: ' + err.message, 'error'));
+
+      } catch(err) {
+        console.error(err);
+        toast('Error al leer el archivo: ' + err.message, 'error');
+      }
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  // ── ADMIN TABLE ───────────────────────────────────────────────────────────
+  function renderAdminTable() {
+    const tbody = document.getElementById('adminTableBody');
+    if (!tbody) return;
+    if (!allParticipants.length) {
+      tbody.innerHTML = `<tr><td colspan="5" class="empty-row">No hay participantes cargados aún.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = allParticipants.map(p => `
+      <tr>
+        <td>${p.nombre}</td>
+        <td>${p.institucion || '—'}</td>
+        <td>${p.designacion || '—'}</td>
+        <td><span class="badge">${p.comision}</span></td>
+      </tr>
+    `).join('');
+    document.getElementById('totalCount').textContent = allParticipants.length;
+  }
+
+  // ── COMMISSION LINKS ──────────────────────────────────────────────────────
+  // Comisiones fijas del CELIDER 10-04
+  const FIXED_COMMISSIONS = [
+    { name: 'CORTE INTERNACIONAL DE JUSTICIA',              icon: '⚖️' },
+    { name: 'ORGANIZACIÓN INTERNACIONAL DEL TRABAJO',  icon: '🏭' },
+    { name: 'ORGANIZACIÓN DEL TRATADO DEL ATLÁNTICO NORTE', icon: '🛡️' },
+    { name: '1955 CONFERENCIA DE BANDUNG',                  icon: '🌍' },
+  ];
+
+  function renderCommissionLinks() {
+    const container = document.getElementById('commissionLinksAdmin');
+    if (!container) return;
+    container.innerHTML = FIXED_COMMISSIONS.map(c => {
+      const slug = slugify(c.name);
+      const saved = commissions[slug] || '';
+      const testBtn = saved ? `<a href="${saved}" target="_blank" class="btn-test-link">&#128279; Probar enlace</a>` : '';
+      const status = saved
+        ? `<span style="color:var(--success);font-size:.78rem;font-weight:700;">&#9989; Enlace guardado</span>`
+        : `<span style="color:var(--gray);font-size:.78rem;">Sin enlace a&#250;n</span>`;
+      return `
+        <div class="link-row">
+          <div class="link-label"><span class="comm-icon">${c.icon}</span>${c.name} &nbsp; ${status}</div>
+          <input class="link-input" type="url" placeholder="https://chat.whatsapp.com/..." value="${saved}" id="wl_${slug}">
+          <button class="btn-save-link" onclick="saveLink('${slug}', '${c.name}')">&#128190; Guardar</button>
+          ${testBtn}
+        </div>
+      `;
+    }).join('');
+  }
+
+  window.saveLink = function(slug, name) {
+    const val = document.getElementById('wl_' + slug).value.trim();
+    update(ref(db, 'commissions'), { [slug]: val }).then(() => {
+      toast('Enlace guardado para ' + name);
+      renderCommissionLinks();
+    }).catch(err => toast('Error: ' + err.message, 'error'));
+  };
+
+  // ── PUBLIC VIEW ───────────────────────────────────────────────────────────
+  function renderPublicCommissions() {
+    const container = document.getElementById('publicComissions');
+    if (!container) return;
+    const groups = {};
+    allParticipants.forEach(p => {
+      if (!groups[p.comision]) groups[p.comision] = [];
+      groups[p.comision].push(p);
+    });
+    const sorted = Object.keys(groups).sort();
+    container.innerHTML = sorted.map(c => {
+      const slug = slugify(c);
+      const link = commissions[slug] || '';
+      return `
+        <div class="commission-card" id="cc_${slug}">
+          <div class="commission-header">
+            <span class="commission-title">${c}</span>
+            <span class="commission-count">${groups[c].length} delegados</span>
+          </div>
+          ${link ? `<a href="${link}" target="_blank" class="whatsapp-btn">💬 Grupo de WhatsApp</a>` : ''}
+          <div class="commission-members">
+            ${groups[c].map((p, idx) => `
+              <div class="member-row">
+                <div class="member-name">${p.nombre}</div>
+                ${p.designacion ? `<div class="member-desig">${p.designacion}</div>` : ''}
+                ${p.institucion ? `<div class="member-info">&#127eb; ${p.institucion}</div>` : ''}
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // ── SEARCH ────────────────────────────────────────────────────────────────
+  window.searchParticipant = function() {
+    const q = document.getElementById('searchInput').value.trim().toLowerCase();
+    const result = document.getElementById('searchResult');
+    if (!q) { result.innerHTML = ''; return; }
+
+    const found = allParticipants.filter(p =>
+      p.nombre.toLowerCase().includes(q) ||
+      (p.institucion && p.institucion.toLowerCase().includes(q)) ||
+      (p.designacion && p.designacion.toLowerCase().includes(q))
+    );
+
+    if (!found.length) {
+      result.innerHTML = `<div class="no-result">❌ No se encontró ningún participante con ese nombre.</div>`;
+      return;
+    }
+
+    result.innerHTML = found.map(p => {
+      const slug = slugify(p.comision);
+      const link = commissions[slug] || '';
+      return `
+        <div class="result-card">
+          <div class="result-name">${p.nombre}</div>
+          <div class="result-details">
+            <span>🏫 ${p.institucion || 'N/D'}</span>
+            <span>🏷️ ${p.designacion || 'N/D'}</span>
+          </div>
+          <div class="result-commission">📋 ${p.comision}</div>
+          ${link ? `<a href="${link}" target="_blank" class="whatsapp-btn small">💬 Unirse al grupo de WhatsApp</a>` : ''}
+        </div>
+      `;
+    }).join('');
+  };
+
+  // ── LOGIN ─────────────────────────────────────────────────────────────────
+  window.doLogin = function() {
+    const user = document.getElementById('adminUser').value.trim();
+    const pass = document.getElementById('adminPass').value.trim();
+    if (user === 'admin' && pass === 'celider1004') {
+      isAdmin = true;
+      document.getElementById('loginSection').style.display = 'none';
+      document.getElementById('adminPanel').style.display = 'block';
+      renderAdminTable();
+      renderCommissionLinks();
+      toast('✅ Bienvenido, Administrador');
+    } else {
+      toast('Usuario o contraseña incorrectos', 'error');
+      document.getElementById('adminUser').classList.add('shake');
+      setTimeout(() => document.getElementById('adminUser').classList.remove('shake'), 500);
+    }
+  };
+
+  window.doLogout = function() {
+    isAdmin = false;
+    document.getElementById('adminPanel').style.display = 'none';
+    document.getElementById('loginSection').style.display = 'flex';
+    showSection('publicSection');
+    document.getElementById('adminUser').value = '';
+    document.getElementById('adminPass').value = '';
+  };
+
+  window.clearAll = function() {
+    if (!confirm('¿Estás seguro de que deseas eliminar TODOS los participantes?')) return;
+    set(ref(db, 'participants'), null).then(() => toast('Listado borrado'));
+  };
+
+  // ── INIT ───────────────────────────────────────────────────────────────────
+  // Pre-seed Bandung link if not already set
+  const BANDUNG_SLUG = '1955_CONFERENCIA_DE_BANDUNG';
+  const BANDUNG_LINK = 'https://chat.whatsapp.com/JM4Pipaw5OGD4J0uXsciDt?mode=hq2tcli';
+
+  function seedBandungLink() {
+    get(ref(db, 'commissions/' + BANDUNG_SLUG)).then(snap => {
+      if (!snap.exists() || !snap.val()) {
+        update(ref(db, 'commissions'), { [BANDUNG_SLUG]: BANDUNG_LINK })
+          .then(() => console.log('Bandung link seeded OK'))
+          .catch(e => console.error('Bandung seed error', e));
+      }
+    });
+  }
+
+  window.addEventListener('DOMContentLoaded', () => {
+    seedBandungLink();
+    loadFromFirebase();
+    // Enter key on search
+    document.getElementById('searchInput').addEventListener('keyup', e => {
+      if (e.key === 'Enter') window.searchParticipant();
+    });
+    document.getElementById('adminPass').addEventListener('keyup', e => {
+      if (e.key === 'Enter') window.doLogin();
+    });
+  });
+</script>
+<style>
+  :root {
+    --navy:    #0a1628;
+    --blue1:   #0d2461;
+    --blue2:   #1340a8;
+    --blue3:   #1a56db;
+    --blue4:   #3b82f6;
+    --accent:  #f59e0b;
+    --light:   #e8f0fe;
+    --white:   #ffffff;
+    --gray:    #94a3b8;
+    --success: #10b981;
+    --error:   #ef4444;
+    --card-bg: #0f1f45;
+    --border:  rgba(59,130,246,0.25);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: 'Open Sans', sans-serif;
+    background: var(--navy);
+    color: var(--white);
+    min-height: 100vh;
+  }
+
+  /* ─── HEADER ─────────────────────────────────────────────── */
+  header {
+    background: linear-gradient(135deg, var(--navy) 0%, var(--blue1) 60%, var(--blue2) 100%);
+    border-bottom: 3px solid var(--blue3);
+    padding: 0 1rem;
+    position: sticky; top: 0; z-index: 100;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  }
+  .header-inner {
+    max-width: 1200px; margin: 0 auto;
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: .5rem; padding: .75rem 0;
+  }
+  .logo {
+    font-family: 'Montserrat', sans-serif;
+    font-weight: 900; font-size: 1.6rem; letter-spacing: 2px;
+    color: var(--white); text-decoration: none;
+    display: flex; align-items: center; gap: .6rem;
+  }
+  .logo span { color: var(--accent); }
+  .logo-sub { font-size: .7rem; font-weight: 600; color: var(--blue4); letter-spacing: 3px; display: block; }
+  nav { display: flex; gap: .5rem; flex-wrap: wrap; }
+  nav button {
+    background: transparent; border: 1.5px solid var(--blue4);
+    color: var(--white); padding: .45rem 1rem; border-radius: 6px;
+    font-family: 'Montserrat', sans-serif; font-size: .78rem; font-weight: 700;
+    letter-spacing: 1px; cursor: pointer; transition: all .2s;
+  }
+  nav button:hover, nav button.active {
+    background: var(--blue3); border-color: var(--blue3);
+  }
+  nav button.accent { background: var(--accent); border-color: var(--accent); color: var(--navy); }
+
+  /* ─── HERO ───────────────────────────────────────────────── */
+  .hero {
+    background: linear-gradient(160deg, var(--blue1) 0%, var(--navy) 100%);
+    text-align: center; padding: 3.5rem 1rem 2.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero h1 {
+    font-family: 'Montserrat', sans-serif;
+    font-size: clamp(2.2rem, 6vw, 4rem); font-weight: 900; letter-spacing: 3px;
+    background: linear-gradient(90deg, var(--white), var(--blue4));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .hero p { color: var(--gray); font-size: 1rem; margin-top: .5rem; letter-spacing: 2px; text-transform: uppercase; }
+
+  /* ─── SEARCH BOX ─────────────────────────────────────────── */
+  .search-wrapper {
+    max-width: 680px; margin: 2rem auto 0;
+    display: flex; gap: .5rem;
+  }
+  .search-wrapper input {
+    flex: 1; padding: .9rem 1.2rem;
+    background: rgba(255,255,255,0.08); border: 2px solid var(--blue3);
+    border-radius: 10px; color: var(--white); font-size: 1rem;
+    font-family: 'Open Sans', sans-serif; outline: none; transition: border .2s;
+  }
+  .search-wrapper input::placeholder { color: var(--gray); }
+  .search-wrapper input:focus { border-color: var(--accent); }
+  .search-wrapper button {
+    padding: .9rem 1.5rem; background: var(--blue3); border: none;
+    border-radius: 10px; color: var(--white); font-weight: 700;
+    font-family: 'Montserrat', sans-serif; cursor: pointer; transition: background .2s;
+    white-space: nowrap;
+  }
+  .search-wrapper button:hover { background: var(--blue4); }
+
+  /* ─── RESULTS ────────────────────────────────────────────── */
+  #searchResult { max-width: 680px; margin: 1.5rem auto 0; }
+  .result-card {
+    background: var(--card-bg); border: 1.5px solid var(--blue3);
+    border-radius: 12px; padding: 1.2rem 1.4rem; margin-bottom: 1rem;
+    animation: fadeIn .3s ease;
+  }
+  .result-name { font-family: 'Montserrat', sans-serif; font-size: 1.2rem; font-weight: 800; color: var(--white); }
+  .result-details { display: flex; gap: 1rem; flex-wrap: wrap; margin: .4rem 0; color: var(--gray); font-size: .88rem; }
+  .result-commission { color: var(--blue4); font-weight: 700; font-size: .95rem; margin: .4rem 0; }
+  .no-result { text-align: center; color: var(--error); padding: 1.2rem; }
+
+  /* ─── MAIN ───────────────────────────────────────────────── */
+  main { max-width: 1200px; margin: 0 auto; padding: 2rem 1rem; }
+  .section { display: none; }
+  .section.active { display: block; }
+
+  /* ─── COMMISSION CARDS ───────────────────────────────────── */
+  .commissions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+    gap: 1.8rem; margin-top: 1.5rem;
+    align-items: start;
+  }
+  .commission-card {
+    background: var(--card-bg); border: 1.5px solid var(--border);
+    border-radius: 16px; overflow: hidden;
+    transition: transform .25s, border-color .25s, box-shadow .25s;
+    display: flex; flex-direction: column;
+  }
+  .commission-card:hover { transform: translateY(-4px); border-color: var(--blue4); box-shadow: 0 12px 40px rgba(26,86,219,.25); }
+  .commission-header {
+    background: linear-gradient(135deg, var(--blue1) 0%, var(--blue2) 100%);
+    padding: 1rem 1.3rem; display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 2px solid var(--blue3);
+  }
+  .commission-title { font-family: 'Montserrat', sans-serif; font-weight: 900; font-size: .92rem; letter-spacing: .5px; line-height: 1.3; }
+  .commission-count { background: var(--blue4); color: var(--white); font-size: .72rem; font-weight: 800; padding: .3rem .75rem; border-radius: 20px; white-space: nowrap; margin-left: .5rem; }
+  .commission-members { padding: .6rem 1.2rem 1rem; max-height: 340px; overflow-y: auto; flex: 1; }
+  .commission-members::-webkit-scrollbar { width: 5px; }
+  .commission-members::-webkit-scrollbar-track { background: rgba(255,255,255,0.04); border-radius: 3px; }
+  .commission-members::-webkit-scrollbar-thumb { background: var(--blue3); border-radius: 3px; }
+  .commission-members::-webkit-scrollbar-thumb:hover { background: var(--blue4); }
+  .member-row {
+    padding: .55rem .4rem; border-bottom: 1px solid rgba(255,255,255,0.06);
+    display: grid; grid-template-columns: 1fr auto; gap: .3rem .6rem; align-items: center;
+  }
+  .member-row:last-child { border-bottom: none; }
+  .member-name { font-weight: 700; font-size: .88rem; color: var(--white); }
+  .member-desig { color: var(--blue4); font-size: .72rem; font-weight: 700; text-align: right; background: rgba(26,86,219,.2); padding: .15rem .5rem; border-radius: 10px; }
+  .member-info { color: var(--gray); font-size: .75rem; grid-column: 1 / -1; margin-top: -.2rem; }
+
+  /* ─── WHATSAPP BTN ───────────────────────────────────────── */
+  .whatsapp-btn {
+    display: block; margin: .5rem 1.2rem .6rem;
+    background: linear-gradient(90deg, #25d366, #128c7e);
+    color: white; text-align: center; padding: .55rem; border-radius: 8px;
+    text-decoration: none; font-weight: 700; font-size: .85rem;
+    transition: opacity .2s;
+  }
+  .whatsapp-btn:hover { opacity: .85; }
+  .whatsapp-btn.small { display: inline-block; margin: .5rem 0 0; padding: .45rem 1rem; }
+
+  /* ─── ADMIN PANEL ────────────────────────────────────────── */
+  #loginSection {
+    min-height: 60vh; display: flex; align-items: center; justify-content: center;
+  }
+  .login-box {
+    background: var(--card-bg); border: 2px solid var(--blue3);
+    border-radius: 16px; padding: 2.5rem; width: 100%; max-width: 420px;
+    text-align: center;
+  }
+  .login-box h2 { font-family: 'Montserrat', sans-serif; font-size: 1.4rem; font-weight: 800; margin-bottom: 1.5rem; color: var(--blue4); }
+  .field { margin-bottom: 1rem; text-align: left; }
+  .field label { display: block; font-size: .82rem; font-weight: 600; color: var(--gray); margin-bottom: .3rem; }
+  .field input {
+    width: 100%; padding: .75rem 1rem; background: rgba(255,255,255,0.07);
+    border: 1.5px solid var(--blue3); border-radius: 8px;
+    color: var(--white); font-size: .95rem; outline: none; transition: border .2s;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .btn-primary {
+    width: 100%; padding: .85rem; background: var(--blue3); border: none;
+    border-radius: 8px; color: var(--white); font-family: 'Montserrat', sans-serif;
+    font-weight: 800; font-size: 1rem; cursor: pointer; transition: background .2s; margin-top: .5rem;
+  }
+  .btn-primary:hover { background: var(--blue4); }
+
+  #adminPanel { display: none; }
+  .admin-tabs { display: flex; gap: .5rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+  .tab-btn {
+    padding: .55rem 1.2rem; background: var(--card-bg); border: 1.5px solid var(--blue3);
+    border-radius: 8px; color: var(--white); font-family: 'Montserrat', sans-serif;
+    font-weight: 700; font-size: .82rem; cursor: pointer; transition: all .2s;
+  }
+  .tab-btn.active, .tab-btn:hover { background: var(--blue3); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  .upload-zone {
+    border: 2px dashed var(--blue3); border-radius: 14px;
+    padding: 2.5rem; text-align: center; background: rgba(19,64,168,.1);
+    transition: border-color .2s;
+  }
+  .upload-zone:hover { border-color: var(--blue4); }
+  .upload-zone h3 { font-family: 'Montserrat', sans-serif; font-size: 1.1rem; margin-bottom: .5rem; }
+  .upload-zone p { color: var(--gray); font-size: .88rem; margin-bottom: 1.2rem; }
+  .upload-zone input[type=file] { display: none; }
+  .btn-upload {
+    display: inline-block; padding: .75rem 1.8rem; background: var(--blue3);
+    border: none; border-radius: 8px; color: var(--white);
+    font-family: 'Montserrat', sans-serif; font-weight: 700; cursor: pointer; transition: background .2s;
+  }
+  .btn-upload:hover { background: var(--blue4); }
+  .hint { color: var(--gray); font-size: .83rem; margin-top: 1rem; }
+
+  .stat-bar {
+    display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem;
+  }
+  .stat-pill {
+    background: var(--card-bg); border: 1px solid var(--border);
+    padding: .6rem 1.2rem; border-radius: 30px; font-size: .85rem;
+    display: flex; align-items: center; gap: .5rem;
+  }
+  .stat-pill strong { color: var(--blue4); }
+
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  thead tr { background: var(--blue1); }
+  th { padding: .75rem 1rem; text-align: left; font-family: 'Montserrat', sans-serif; font-size: .78rem; letter-spacing: 1px; color: var(--gray); }
+  td { padding: .65rem 1rem; border-bottom: 1px solid var(--border); }
+  tbody tr:hover { background: rgba(59,130,246,.07); }
+  .empty-row { text-align: center; color: var(--gray); padding: 2rem !important; }
+  .badge {
+    background: rgba(26,86,219,.25); color: var(--blue4);
+    padding: .2rem .6rem; border-radius: 20px; font-size: .75rem; font-weight: 700;
+    white-space: nowrap;
+  }
+  .table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid var(--border); }
+
+  /* Links admin */
+  .link-row {
+    display: flex; align-items: center; gap: .75rem; flex-wrap: wrap;
+    background: var(--card-bg); border: 1.5px solid var(--border);
+    border-radius: 14px; padding: 1.1rem 1.2rem; margin-bottom: 1rem;
+    transition: border-color .2s;
+  }
+  .link-row:hover { border-color: var(--blue4); }
+  .link-label {
+    font-family: 'Montserrat', sans-serif; font-weight: 800; font-size: .88rem;
+    flex: 0 0 100%; color: var(--white); margin-bottom: .3rem;
+    display: flex; align-items: center; gap: .5rem;
+  }
+  .link-label .comm-icon { font-size: 1.3rem; }
+  .link-input {
+    flex: 1; min-width: 200px; padding: .65rem 1rem;
+    background: rgba(255,255,255,0.07); border: 1.5px solid var(--blue3);
+    border-radius: 8px; color: var(--white); font-size: .88rem; outline: none;
+    transition: border .2s;
+  }
+  .link-input:focus { border-color: var(--accent); }
+  .btn-save-link {
+    padding: .65rem 1.2rem; background: var(--success); border: none;
+    border-radius: 8px; color: var(--white); font-weight: 700; font-size: .85rem;
+    cursor: pointer; white-space: nowrap; transition: opacity .2s;
+  }
+  .btn-save-link:hover { opacity: .85; }
+  .btn-test-link {
+    padding: .55rem 1rem; background: transparent; border: 1.5px solid var(--success);
+    border-radius: 7px; color: var(--success); font-weight: 700; font-size: .82rem;
+    cursor: pointer; white-space: nowrap; text-decoration: none; transition: all .2s;
+  }
+  .btn-test-link:hover { background: var(--success); color: var(--white); }
+  .btn-danger {
+    padding: .55rem 1.2rem; background: var(--error); border: none;
+    border-radius: 7px; color: var(--white); font-weight: 700; font-size: .82rem;
+    cursor: pointer; transition: opacity .2s;
+  }
+  .btn-danger:hover { opacity: .85; }
+
+  /* ─── TOAST ──────────────────────────────────────────────── */
+  .toast {
+    position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%) translateY(80px);
+    background: var(--success); color: var(--white);
+    padding: .85rem 1.8rem; border-radius: 30px; font-weight: 700;
+    font-family: 'Montserrat', sans-serif; font-size: .9rem;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.4); transition: transform .35s ease, opacity .35s;
+    opacity: 0; z-index: 999; white-space: nowrap;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+  .toast.error { background: var(--error); }
+
+  /* ─── MISC ───────────────────────────────────────────────── */
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-6px)} 75%{transform:translateX(6px)} }
+  .shake { animation: shake .4s ease; }
+
+  .section-title {
+    font-family: 'Montserrat', sans-serif; font-weight: 800; font-size: 1.3rem;
+    color: var(--white); margin-bottom: .3rem; display: flex; align-items: center; gap: .5rem;
+  }
+  .section-title::after {
+    content: ''; flex: 1; height: 2px;
+    background: linear-gradient(90deg, var(--blue3), transparent); margin-left: .5rem;
+  }
+  .section-sub { color: var(--gray); font-size: .88rem; margin-bottom: 1.5rem; }
+
+  footer {
+    text-align: center; padding: 1.5rem; color: var(--gray); font-size: .8rem;
+    border-top: 1px solid var(--border); margin-top: 3rem;
+  }
+  footer strong { color: var(--blue4); }
+
+  @media (max-width: 600px) {
+    .search-wrapper { flex-direction: column; }
+    .link-label { flex: 0 0 100%; }
+    .member-row { flex-direction: column; gap: .15rem; }
+    .member-info { text-align: left; }
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="header-inner">
+    <a class="logo" href="#">
+      <div>
+        CELIDER <span>10-04</span>
+        <span class="logo-sub">LISTADO OFICIAL DE COMISIONES</span>
+      </div>
+    </a>
+    <nav>
+      <button onclick="showPub()" id="navPub" class="active">🔍 Buscar Asignación</button>
+      <button onclick="showComis()" id="navCom">📋 Comisiones</button>
+      <button onclick="showAdmin()" id="navAdm" class="accent">🔐 Admin</button>
+    </nav>
+  </div>
+</header>
+
+<!-- HERO + SEARCH -->
+<div class="hero">
+  <h1>CELIDER 10-04</h1>
+  <p>Listado Oficial de Comisiones — Tiempo Real</p>
+  <div class="search-wrapper">
+    <input id="searchInput" type="text" placeholder="Busca tu nombre o institución...">
+    <button onclick="searchParticipant()">🔍 Buscar</button>
+  </div>
+  <div id="searchResult"></div>
+</div>
+
+<!-- MAIN -->
+<main>
+
+  <!-- PUBLIC SECTION -->
+  <div id="publicSection" class="section active">
+    <h2 class="section-title">📋 Todas las Comisiones</h2>
+    <p class="section-sub">Listado en tiempo real — se actualiza automáticamente</p>
+    <div id="publicComissions" class="commissions-grid">
+      <p style="color:var(--gray);grid-column:1/-1;text-align:center;padding:3rem">Cargando información...</p>
+    </div>
+  </div>
+
+  <!-- COMMISSIONS SECTION (same content, shown from nav) -->
+  <div id="comisSection" class="section">
+    <h2 class="section-title">🗂️ Vista por Comisiones</h2>
+    <p class="section-sub">Explora todos los grupos y sus delegados</p>
+    <div id="publicComissions2" class="commissions-grid">
+      <p style="color:var(--gray);grid-column:1/-1;text-align:center;padding:3rem">Cargando...</p>
+    </div>
+  </div>
+
+  <!-- ADMIN SECTION -->
+  <div id="adminSection" class="section">
+
+    <!-- LOGIN -->
+    <div id="loginSection" style="display:flex">
+      <div class="login-box">
+        <div style="font-size:2.5rem;margin-bottom:1rem">🔐</div>
+        <h2>ACCESO ADMINISTRADOR</h2>
+        <div class="field">
+          <label>Usuario</label>
+          <input id="adminUser" type="text" placeholder="admin">
+        </div>
+        <div class="field">
+          <label>Contraseña</label>
+          <input id="adminPass" type="password" placeholder="••••••••">
+        </div>
+        <button class="btn-primary" onclick="doLogin()">INGRESAR</button>
+      </div>
+    </div>
+
+    <!-- PANEL -->
+    <div id="adminPanel">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:1.5rem">
+        <h2 class="section-title" style="margin:0">⚙️ Panel de Administración</h2>
+        <button onclick="doLogout()" style="padding:.5rem 1rem;background:transparent;border:1.5px solid var(--error);color:var(--error);border-radius:7px;cursor:pointer;font-weight:700;font-size:.82rem">🚪 Cerrar sesión</button>
+      </div>
+
+      <div class="admin-tabs">
+        <button class="tab-btn active" onclick="switchTab('tabUpload', this)">📤 Subir Listado</button>
+        <button class="tab-btn" onclick="switchTab('tabList', this)">👥 Ver Participantes</button>
+        <button class="tab-btn" onclick="switchTab('tabLinks', this)">💬 Links WhatsApp</button>
+      </div>
+
+      <!-- TAB: UPLOAD -->
+      <div id="tabUpload" class="tab-content active">
+        <div class="upload-zone">
+          <div style="font-size:3rem;margin-bottom:.5rem">📊</div>
+          <h3>Subir Listado Excel</h3>
+          <p>El sistema detecta automáticamente las columnas del archivo</p>
+          <input type="file" id="excelFile" accept=".xlsx,.xls,.csv" onchange="handleExcelUpload(event)">
+          <label for="excelFile" class="btn-upload">📂 Seleccionar archivo Excel</label>
+          <div style="margin-top:1.2rem;background:rgba(0,0,0,0.35);border-radius:10px;padding:1rem;text-align:left">
+            <p style="font-size:.8rem;color:var(--accent);font-weight:700;margin-bottom:.5rem">📌 ENCABEZADOS EN LA FILA 1 DEL EXCEL:</p>
+            <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+              <span style="background:var(--blue1);border:1px solid var(--blue3);padding:.25rem .75rem;border-radius:6px;font-size:.82rem;font-family:monospace;letter-spacing:.5px">INSTITUCIÓN</span>
+              <span style="background:var(--blue1);border:1px solid var(--blue3);padding:.25rem .75rem;border-radius:6px;font-size:.82rem;font-family:monospace;letter-spacing:.5px">NOMBRE</span>
+              <span style="background:var(--blue1);border:1px solid var(--blue3);padding:.25rem .75rem;border-radius:6px;font-size:.82rem;font-family:monospace;letter-spacing:.5px">DESIGNACIÓN</span>
+              <span style="background:var(--blue1);border:1px solid var(--accent);padding:.25rem .75rem;border-radius:6px;font-size:.82rem;font-family:monospace;letter-spacing:.5px;color:var(--accent)">COMISIÓN ✔ obligatorio</span>
+            </div>
+            <p style="font-size:.75rem;color:var(--gray);margin-top:.6rem">Acepta mayúsculas, minúsculas, con o sin tildes. Solo NOMBRE y COMISIÓN son obligatorios.</p>
+          </div>
+          <div id="debugLog" style="display:none;margin-top:1rem;background:rgba(239,68,68,.12);border:1px solid var(--error);border-radius:8px;padding:.8rem;font-size:.78rem;font-family:monospace;color:#fca5a5;text-align:left;white-space:pre-wrap;word-break:break-all"></div>
+        </div>
+        <div style="margin-top:1rem;display:flex;justify-content:flex-end">
+          <button class="btn-danger" onclick="clearAll()">🗑️ Borrar todo el listado</button>
+        </div>
+      </div>
+
+      <!-- TAB: LIST -->
+      <div id="tabList" class="tab-content">
+        <div class="stat-bar">
+          <div class="stat-pill">👥 Total participantes: <strong id="totalCount">0</strong></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>NOMBRE</th><th>INSTITUCIÓN</th><th>DESIGNACIÓN</th><th>COMISIÓN</th></tr></thead>
+            <tbody id="adminTableBody">
+              <tr><td colspan="4" class="empty-row">No hay datos cargados.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB: LINKS -->
+      <div id="tabLinks" class="tab-content">
+        <h3 class="section-title">💬 Links de WhatsApp por Comisión</h3>
+        <p class="section-sub">Ingresa el enlace de cada grupo para que los participantes puedan unirse</p>
+        <div id="commissionLinksAdmin">
+          <p class="hint">Carga el listado primero para ver las comisiones.</p>
+        </div>
+      </div>
+
+    </div><!-- /adminPanel -->
+  </div><!-- /adminSection -->
+
+</main>
+
+<footer>
+  <strong>CELIDER 10-04</strong> — Listado Oficial de Comisiones &nbsp;|&nbsp; Powered by Firebase Realtime Database
+</footer>
+
+<div id="toast" class="toast"></div>
+
+<script>
+  function showPub() {
+    document.getElementById('publicSection').classList.add('active');
+    document.getElementById('comisSection').classList.remove('active');
+    document.getElementById('adminSection').classList.remove('active');
+    setNav('navPub');
+  }
+  function showComis() {
+    document.getElementById('comisSection').classList.add('active');
+    document.getElementById('publicSection').classList.remove('active');
+    document.getElementById('adminSection').classList.remove('active');
+    setNav('navCom');
+    // Mirror content
+    document.getElementById('publicComissions2').innerHTML = document.getElementById('publicComissions').innerHTML;
+  }
+  function showAdmin() {
+    document.getElementById('adminSection').classList.add('active');
+    document.getElementById('publicSection').classList.remove('active');
+    document.getElementById('comisSection').classList.remove('active');
+    setNav('navAdm');
+  }
+  function setNav(id) {
+    ['navPub','navCom','navAdm'].forEach(n => document.getElementById(n).classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+  }
+  function switchTab(id, btn) {
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+    btn.classList.add('active');
+  }
+  // Make sections visible initially
+  document.getElementById('publicSection').classList.add('active');
+</script>
+</body>
+</html>
